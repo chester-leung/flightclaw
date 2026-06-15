@@ -4,6 +4,7 @@
 Qualifying = total price for 2 adults <= $1,800 USD ($900 per person).
 """
 
+import random
 import time
 
 from fli.models import (
@@ -15,6 +16,7 @@ from fli.models import (
     SeatType,
     TripType,
 )
+from fli.search.exceptions import SearchClientError
 from search_utils import search_with_currency
 
 DEPART_DATE = "2027-01-02"
@@ -25,6 +27,9 @@ TOTAL_THRESHOLD = 1800.0  # USD, total for 2 adults
 ADULTS = 2
 MAX_RETRIES = 60
 RETRY_SLEEP = 0.5
+MAX_BACKOFF = 30.0  # cap on exponential backoff between throttled attempts
+ROUTE_DEADLINE = 120.0  # max seconds spent on a single route before giving up
+ROUTE_PAUSE = 5.0  # pause between routes so we don't blast all six back-to-back
 
 
 def build_filters(origin_code):
@@ -47,18 +52,36 @@ def build_filters(origin_code):
 
 
 def search_route(origin_code):
-    """Search a route with aggressive retry on the gRPC-13 empty envelope.
+    """Search a route, retrying on both transient failure modes.
 
-    Returns (results, currency, attempts, ok). ok is False only when we
-    exhausted all retries without ever getting data.
+    Two distinct failures need handling:
+      * gRPC-13 empty envelope -> search_with_currency returns no results.
+        These clear quickly, so retry at the fixed RETRY_SLEEP cadence.
+      * HTTP 429 / timeout / connection drop -> search_with_currency raises
+        SearchClientError. raise_for_status() inside the library would
+        otherwise crash the whole script and skip every later route, so we
+        catch it and back off exponentially instead of hammering.
+
+    Bounded by both MAX_RETRIES and a wall-clock ROUTE_DEADLINE so a hard-
+    throttled route can't stall the run. Returns (results, currency,
+    attempts, ok); ok is False only when we never got data.
     """
     filters = build_filters(origin_code)
-    for attempt in range(1, MAX_RETRIES + 1):
-        results, currency = search_with_currency(filters, top_n=TOP_N)
+    backoff = RETRY_SLEEP
+    deadline = time.monotonic() + ROUTE_DEADLINE
+    attempt = 0
+    while attempt < MAX_RETRIES and time.monotonic() < deadline:
+        attempt += 1
+        try:
+            results, currency = search_with_currency(filters, top_n=TOP_N)
+        except SearchClientError:  # 429 / timeout / blocked — back off, don't crash
+            time.sleep(min(backoff, MAX_BACKOFF) + random.uniform(0, 0.5))
+            backoff = min(backoff * 2, MAX_BACKOFF)
+            continue
         if results:
             return results, currency, attempt, True
         time.sleep(RETRY_SLEEP)
-    return None, None, MAX_RETRIES, False
+    return None, None, attempt, False
 
 
 def fmt_duration(minutes):
@@ -96,7 +119,9 @@ def main():
     failures = []  # origins with no data after retries
     nonusd = []  # (origin, currency)
 
-    for origin in ORIGINS:
+    for idx, origin in enumerate(ORIGINS):
+        if idx > 0:
+            time.sleep(ROUTE_PAUSE)  # space out routes to ease rate limiting
         print(f"\n{'='*64}\nSearching {origin} -> {DEST} on {DEPART_DATE} (2 adults, economy)...")
         results, currency, attempts, ok = search_route(origin)
         if not ok:
